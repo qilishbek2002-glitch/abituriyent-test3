@@ -2,8 +2,11 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:android_id/android_id.dart';
+import 'package:crypto/crypto.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -13,9 +16,13 @@ import 'config.dart';
 import 'l10n.dart';
 import 'models.dart';
 
-enum ActivateResult { ok, bad, wrongDevice, used }
+enum ActivateResult { ok, bad, wrongDevice, expired }
 
-/// Butun ilova holati (til, kalit, obuna, kitoblar, testlar).
+enum AddKeyResult { ok, limit, duplicate, empty }
+
+const String _kIdAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+/// Butun ilova holati (til, mavzu, kalitlar, obuna, kitoblar, testlar, natijalar).
 final AppState app = AppState();
 
 String subjectName(String id) => tr('subject_$id');
@@ -25,15 +32,23 @@ class AppState extends ChangeNotifier {
 
   String lang = 'uz';
   bool langChosen = false;
-  String apiKey = '';
+  bool keysOnboarded = false;
+  ThemeMode themeMode = ThemeMode.system;
+  List<AiKey> keys = [];
   String deviceId = '';
-  int expiresAt = 0;
-  int lastSeen = 0;
+
+  /// Obuna: tugash sanasi (YYYYMMDD, Toshkent vaqti bo'yicha shu kun oxirigacha) va tarif kunlari.
+  String expiryYmd = '';
+  int planDays = 0;
+  String lastActivatedExpiry = '';
+
+  /// Serverdan olingan eng so'nggi vaqt: soatni orqaga surib aldashga yo'l qo'ymaydi.
+  int serverFloor = 0;
   int trialLeft = kFreeTests;
-  int lastActivatedDays = 0;
-  Set<String> usedCodes = <String>{};
+
   List<PersonalBook> personalBooks = [];
   List<SavedTest> tests = [];
+  List<Attempt> attempts = [];
   Map<String, String> subjectImages = {};
   List<String> pdfAssets = [];
 
@@ -45,16 +60,43 @@ class AppState extends ChangeNotifier {
     lang = savedLang ?? 'uz';
     currentLang = lang;
 
-    apiKey = _p.getString('apiKey') ?? '';
-    deviceId = _p.getString('deviceId') ?? '';
-    if (deviceId.isEmpty) {
-      deviceId = _newDeviceId();
-      await _p.setString('deviceId', deviceId);
+    switch (_p.getString('theme')) {
+      case 'light':
+        themeMode = ThemeMode.light;
+        break;
+      case 'dark':
+        themeMode = ThemeMode.dark;
+        break;
+      default:
+        themeMode = ThemeMode.system;
     }
-    expiresAt = _p.getInt('expiresAt') ?? 0;
-    lastSeen = _p.getInt('lastSeen') ?? 0;
+
+    // Kalitlar (eski versiyadagi bitta 'apiKey' ni ko'chiramiz).
+    try {
+      final raw = _p.getString('keys');
+      if (raw != null) {
+        keys = (jsonDecode(raw) as List)
+            .map((e) => AiKey.fromJson(Map<String, dynamic>.from(e as Map)))
+            .toList();
+      }
+    } catch (_) {
+      keys = [];
+    }
+    final legacy = _p.getString('apiKey') ?? '';
+    if (keys.isEmpty && legacy.isNotEmpty) {
+      keys = [AiKey(id: _newId(), provider: AiProviderType.gemini, key: legacy)];
+      await _saveKeys();
+      await _p.setBool('onboarded', true);
+    }
+    keysOnboarded = _p.getBool('onboarded') ?? false;
+
+    deviceId = await _resolveDeviceId();
+
+    expiryYmd = _p.getString('expiryYmd') ?? '';
+    planDays = _p.getInt('planDays') ?? 0;
+    lastActivatedExpiry = '';
+    serverFloor = _p.getInt('serverFloor') ?? 0;
     trialLeft = _p.getInt('trialLeft') ?? kFreeTests;
-    usedCodes = (_p.getStringList('usedCodes') ?? <String>[]).toSet();
 
     try {
       final raw = _p.getString('personal');
@@ -66,8 +108,6 @@ class AppState extends ChangeNotifier {
     } catch (_) {
       personalBooks = [];
     }
-
-    await _touch();
 
     try {
       final manifest = await AssetManifest.loadFromAssetBundle(rootBundle);
@@ -90,45 +130,138 @@ class AppState extends ChangeNotifier {
     } catch (_) {}
 
     await _loadTests();
+    await _loadAttempts();
+  }
+
+  // ---------------- qurilma ID ----------------
+
+  /// Barqaror ID: Android ID dan hosil qilinadi (ilovani o'chirib qayta o'rnatsa ham o'zgarmaydi,
+  /// agar ilova doim bir xil kalit bilan imzolangan bo'lsa). Olinmasa tasodifiy ID saqlanadi.
+  Future<String> _resolveDeviceId() async {
+    try {
+      final aid = await AndroidId().getId();
+      if (aid != null && aid.isNotEmpty) {
+        final bytes = sha256.convert(utf8.encode('abt|$aid')).bytes;
+        final id = [
+          for (var i = 0; i < 8; i++) _kIdAlphabet[bytes[i] % _kIdAlphabet.length]
+        ].join();
+        await _p.setString('deviceId', id);
+        return id;
+      }
+    } catch (_) {}
+    var id = _p.getString('deviceId') ?? '';
+    if (!RegExp(r'^[A-HJ-NP-Z2-9]{8}$').hasMatch(id)) {
+      final r = Random.secure();
+      id = List.generate(8, (_) => _kIdAlphabet[r.nextInt(_kIdAlphabet.length)])
+          .join();
+      await _p.setString('deviceId', id);
+    }
+    return id;
   }
 
   // ---------------- vaqt va obuna ----------------
 
-  Future<void> _touch() async {
-    final now = DateTime.now().millisecondsSinceEpoch;
-    if (now > lastSeen) {
-      lastSeen = now;
-      await _p.setInt('lastSeen', now);
-    }
-  }
+  int get nowMs => max(DateTime.now().millisecondsSinceEpoch, serverFloor);
 
-  /// Soatni orqaga surib aldashni oldini olish uchun: eng so'nggi ko'rilgan vaqtdan kichik bo'lmaydi.
-  int get nowMs => max(DateTime.now().millisecondsSinceEpoch, lastSeen);
+  /// Obuna tugash vaqti (millisekund): tugash sanasi kunining oxiri, Toshkent vaqti (UTC+5).
+  int get expiresAt {
+    if (expiryYmd.length != 8) return 0;
+    final y = int.tryParse(expiryYmd.substring(0, 4));
+    final m = int.tryParse(expiryYmd.substring(4, 6));
+    final d = int.tryParse(expiryYmd.substring(6, 8));
+    if (y == null || m == null || d == null) return 0;
+    return DateTime.utc(y, m, d + 1).millisecondsSinceEpoch - 5 * 3600000;
+  }
 
   bool get subscribed => expiresAt > nowMs;
 
+  /// Obuna tugash kunigacha qolgan kalendar kunlar (Toshkent vaqti). Tugash kunining o'zida 0.
+  /// Yangi 365 kunlik kod olingan kuni 365 ko'rinadi.
   int get daysLeft {
-    final d = ((expiresAt - nowMs) / 86400000).ceil();
-    return d < 0 ? 0 : d;
+    if (expiryYmd.length != 8) return 0;
+    final y = int.tryParse(expiryYmd.substring(0, 4));
+    final m = int.tryParse(expiryYmd.substring(4, 6));
+    final d = int.tryParse(expiryYmd.substring(6, 8));
+    if (y == null || m == null || d == null) return 0;
+    final t = DateTime.fromMillisecondsSinceEpoch(nowMs, isUtc: true)
+        .add(const Duration(hours: 5));
+    final diff = DateTime.utc(y, m, d)
+        .difference(DateTime.utc(t.year, t.month, t.day))
+        .inDays;
+    return diff < 0 ? 0 : diff;
   }
+
+  /// Obuna tugagan kuni (UI uchun, DD.MM.YYYY).
+  String get expiryLabel {
+    if (expiryYmd.length != 8) return '';
+    return '${expiryYmd.substring(6, 8)}.${expiryYmd.substring(4, 6)}.${expiryYmd.substring(0, 4)}';
+  }
+
+  /// Obunada 0..1 qolgan ulush (progress chizig'i uchun).
+  double get planFraction {
+    if (planDays <= 0) return 0;
+    final f = daysLeft / planDays;
+    return f < 0 ? 0 : (f > 1 ? 1 : f);
+  }
+
+  bool get hasKeys => keys.isNotEmpty;
 
   bool get canGenerate => !kSubscriptionRequired || subscribed || trialLeft > 0;
 
+  /// Bepul rejimda faqat [kFreeQuestions] talik testlar ruxsat etiladi.
+  bool get freeOnly => kSubscriptionRequired && !subscribed;
+
+  /// Serverdan haqiqiy vaqtni olib, soat orqaga surilganini aniqlaydi. Xato bo'lsa jim o'tadi.
+  Future<void> syncServerTime() async {
+    HttpClient? c;
+    try {
+      c = HttpClient()..connectionTimeout = const Duration(seconds: 6);
+      final req = await c
+          .getUrl(Uri.parse('https://www.google.com/generate_204'))
+          .timeout(const Duration(seconds: 8));
+      final res = await req.close().timeout(const Duration(seconds: 8));
+      final h = res.headers.value('date');
+      await res.drain<void>();
+      if (h != null) {
+        final ms = HttpDate.parse(h).millisecondsSinceEpoch;
+        if (ms > serverFloor) {
+          serverFloor = ms;
+          await _p.setInt('serverFloor', ms);
+          notifyListeners();
+        }
+      }
+    } catch (_) {
+    } finally {
+      c?.close(force: true);
+    }
+  }
+
   Future<ActivateResult> activate(String raw) async {
-    await _touch();
     final r = parseCode(raw, deviceId);
     if (r.status == CodeStatus.badFormat || r.status == CodeStatus.badSignature) {
       return ActivateResult.bad;
     }
     if (r.status == CodeStatus.wrongDevice) return ActivateResult.wrongDevice;
-    if (usedCodes.contains(r.key)) return ActivateResult.used;
 
-    final base = max(nowMs, expiresAt);
-    expiresAt = base + r.days * 86400000;
-    usedCodes.add(r.key);
-    lastActivatedDays = r.days;
-    await _p.setInt('expiresAt', expiresAt);
-    await _p.setStringList('usedCodes', usedCodes.toList());
+    await syncServerTime();
+    final prevYmd = expiryYmd;
+    final prevPlan = planDays;
+    expiryYmd = r.expiry;
+    if (expiresAt <= nowMs) {
+      expiryYmd = prevYmd;
+      planDays = prevPlan;
+      return ActivateResult.expired;
+    }
+    // Yangi kod eskisidan keyinroq tugasa almashtiramiz; aks holda eskisi qoladi.
+    if (prevYmd.compareTo(r.expiry) > 0) {
+      expiryYmd = prevYmd;
+      planDays = prevPlan;
+    } else {
+      planDays = r.days;
+    }
+    lastActivatedExpiry = expiryLabel;
+    await _p.setString('expiryYmd', expiryYmd);
+    await _p.setInt('planDays', planDays);
     notifyListeners();
     return ActivateResult.ok;
   }
@@ -141,7 +274,7 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  // ---------------- til va kalit ----------------
+  // ---------------- til, mavzu, kalitlar ----------------
 
   Future<void> setLang(String l) async {
     lang = l;
@@ -151,11 +284,42 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> setApiKey(String key) async {
-    apiKey = key;
-    await _p.setString('apiKey', key);
+  Future<void> setThemeMode(ThemeMode m) async {
+    themeMode = m;
+    await _p.setString(
+        'theme', m == ThemeMode.light ? 'light' : (m == ThemeMode.dark ? 'dark' : 'system'));
     notifyListeners();
   }
+
+  Future<void> finishKeyOnboarding() async {
+    keysOnboarded = true;
+    await _p.setBool('onboarded', true);
+    notifyListeners();
+  }
+
+  Future<AddKeyResult> addKey(AiProviderType provider, String raw) async {
+    final key = raw.trim();
+    if (key.isEmpty) return AddKeyResult.empty;
+    if (keys.length >= kMaxKeys) return AddKeyResult.limit;
+    if (keys.any((k) => k.key == key)) return AddKeyResult.duplicate;
+    keys = [...keys, AiKey(id: _newId(), provider: provider, key: key)];
+    await _saveKeys();
+    notifyListeners();
+    return AddKeyResult.ok;
+  }
+
+  Future<void> removeKey(String id) async {
+    keys = keys.where((k) => k.id != id).toList();
+    await _saveKeys();
+    notifyListeners();
+  }
+
+  Future<void> _saveKeys() async {
+    await _p.setString('keys', jsonEncode(keys.map((k) => k.toJson()).toList()));
+  }
+
+  String _newId() =>
+      '${DateTime.now().microsecondsSinceEpoch}${Random().nextInt(9999)}';
 
   // ---------------- kitoblar ----------------
 
@@ -287,20 +451,70 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> recordResult(String id, int percent) async {
+  Future<void> recordAttempt({
+    required String testId,
+    required String title,
+    required String? subjectId,
+    required int total,
+    required int correct,
+    required int seconds,
+  }) async {
+    final percent = total == 0 ? 0 : (correct * 100 / total).round();
     for (final t in tests) {
-      if (t.id == id) {
+      if (t.id == testId) {
         t.attempts += 1;
         if (percent > t.bestPercent) t.bestPercent = percent;
       }
     }
+    attempts = [
+      ...attempts,
+      Attempt(
+        t: nowMs,
+        testId: testId,
+        title: title,
+        subjectId: subjectId,
+        total: total,
+        correct: correct,
+        seconds: seconds,
+      ),
+    ];
+    if (attempts.length > 3000) attempts = attempts.sublist(attempts.length - 3000);
     await _saveTests();
+    await _saveAttempts();
     notifyListeners();
   }
 
-  String _newDeviceId() {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    final r = Random.secure();
-    return List.generate(8, (_) => chars[r.nextInt(chars.length)]).join();
+  // ---------------- oylik natijalar ----------------
+
+  List<Attempt> attemptsIn(int year, int month) {
+    return attempts.where((a) {
+      final d = DateTime.fromMillisecondsSinceEpoch(a.t);
+      return d.year == year && d.month == month;
+    }).toList();
+  }
+
+  Future<File> _attemptsFile() async {
+    final dir = await getApplicationDocumentsDirectory();
+    return File('${dir.path}/attempts.json');
+  }
+
+  Future<void> _loadAttempts() async {
+    try {
+      final f = await _attemptsFile();
+      if (await f.exists()) {
+        attempts = (jsonDecode(await f.readAsString()) as List)
+            .map((e) => Attempt.fromJson(Map<String, dynamic>.from(e as Map)))
+            .toList();
+      }
+    } catch (_) {
+      attempts = [];
+    }
+  }
+
+  Future<void> _saveAttempts() async {
+    try {
+      final f = await _attemptsFile();
+      await f.writeAsString(jsonEncode(attempts.map((a) => a.toJson()).toList()));
+    } catch (_) {}
   }
 }
