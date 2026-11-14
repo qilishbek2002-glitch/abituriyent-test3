@@ -5,13 +5,129 @@ import 'package:url_launcher/url_launcher.dart';
 import '../app_state.dart';
 import '../config.dart';
 import '../l10n.dart';
+import '../theme.dart';
 import '../ui.dart';
-import 'language_screen.dart';
+
+/// Test tuzish/yechishga ruxsat bor-yo'qligini tekshiradi.
+/// Ruxsat bo'lmasa to'lov oynasini ochadi va false qaytaradi.
+bool ensureAccess(BuildContext context) {
+  if (app.canGenerate) return true;
+  Navigator.of(context).push(
+    MaterialPageRoute(builder: (_) => const PaywallScreen()),
+  );
+  return false;
+}
+
+Future<void> openBot(BuildContext context) async {
+  var ok = false;
+  try {
+    ok = await launchUrl(Uri.parse('https://t.me/$kBotUsername'),
+        mode: LaunchMode.externalApplication);
+  } catch (_) {
+    ok = false;
+  }
+  if (!ok && context.mounted) showSnack(context, tr('cannot_open_link'));
+}
+
+/// Obuna holati kartasi: necha kunlik tarif va qancha kun qolgani.
+class SubscriptionCard extends StatelessWidget {
+  final VoidCallback? onTap;
+  const SubscriptionCard({super.key, this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = brandGradient(context);
+    final sub = app.subscribed;
+    final children = <Widget>[];
+    if (sub) {
+      children.add(Row(
+        children: [
+          const Icon(Icons.verified, color: Colors.white),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              app.planDays > 0
+                  ? tr('plan_name', {'d': '${app.planDays}'})
+                  : tr('subscription'),
+              style: const TextStyle(
+                  color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ],
+      ));
+      children.add(const SizedBox(height: 10));
+      children.add(Text(
+        app.daysLeft == 0
+            ? tr('sub_today')
+            : tr('sub_left_line', {'d': '${app.daysLeft}'}),
+        style: const TextStyle(
+            color: Colors.white, fontSize: 26, fontWeight: FontWeight.w800),
+      ));
+      if (app.planDays > 0) {
+        children.add(const SizedBox(height: 10));
+        children.add(ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: LinearProgressIndicator(
+            value: app.planFraction,
+            minHeight: 8,
+            color: Colors.white,
+            backgroundColor: Colors.white24,
+          ),
+        ));
+      }
+      children.add(const SizedBox(height: 8));
+      children.add(Text(
+        tr('sub_until_line', {'s': app.expiryLabel}),
+        style: const TextStyle(color: Colors.white70),
+      ));
+    } else {
+      children.add(Row(
+        children: [
+          const Icon(Icons.lock_open, color: Colors.white),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              app.expiryYmd.isNotEmpty ? tr('sub_expired') : tr('sub_none'),
+              style: const TextStyle(
+                  color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ],
+      ));
+      children.add(const SizedBox(height: 8));
+      children.add(Text(
+        app.trialLeft > 0
+            ? tr('trial_left', {'n': '${app.trialLeft}', 'q': '$kFreeQuestions'})
+            : tr('trial_over'),
+        style: const TextStyle(color: Colors.white, fontSize: 15),
+      ));
+    }
+    return Container(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+            begin: Alignment.topLeft, end: Alignment.bottomRight, colors: colors),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(20),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.all(18),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: children,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 class PaywallScreen extends StatefulWidget {
-  /// true bo'lsa: orqaga qaytib bo'lmaydi (obuna kerak).
-  final bool locked;
-  const PaywallScreen({super.key, this.locked = false});
+  const PaywallScreen({super.key});
 
   @override
   State<PaywallScreen> createState() => _PaywallScreenState();
@@ -33,19 +149,6 @@ class _PaywallScreenState extends State<PaywallScreen> {
     if (mounted) showSnack(context, tr('copied'));
   }
 
-  Future<void> _openTelegram() async {
-    final text = Uri.encodeComponent(
-        "Salom! Abituriyent Test ilovasi uchun obuna to'lovini qildim. Qurilma ID: ${app.deviceId}");
-    final uri = Uri.parse('https://t.me/$kAdminTelegram?text=$text');
-    var ok = false;
-    try {
-      ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
-    } catch (_) {
-      ok = false;
-    }
-    if (!ok && mounted) showSnack(context, tr('cannot_open_link'));
-  }
-
   Future<void> _activate() async {
     if (_ctrl.text.trim().isEmpty) return;
     setState(() {
@@ -57,8 +160,8 @@ class _PaywallScreenState extends State<PaywallScreen> {
     setState(() => _busy = false);
     switch (r) {
       case ActivateResult.ok:
-        showSnack(context, tr('code_ok', {'d': app.lastActivatedDays.toString()}));
-        if (!widget.locked) Navigator.of(context).pop();
+        showSnack(context, tr('code_ok', {'s': app.lastActivatedExpiry}));
+        Navigator.of(context).pop();
         break;
       case ActivateResult.bad:
         setState(() => _msg = tr('code_bad'));
@@ -66,10 +169,17 @@ class _PaywallScreenState extends State<PaywallScreen> {
       case ActivateResult.wrongDevice:
         setState(() => _msg = tr('code_other_device'));
         break;
-      case ActivateResult.used:
-        setState(() => _msg = tr('code_used'));
+      case ActivateResult.expired:
+        setState(() => _msg = tr('code_expired'));
         break;
     }
+  }
+
+  int _savePercent(Plan p) {
+    final base = kPlans.first.price / kPlans.first.days;
+    final cur = p.price / p.days;
+    final v = ((1 - cur / base) * 100).round();
+    return v;
   }
 
   @override
@@ -77,96 +187,77 @@ class _PaywallScreenState extends State<PaywallScreen> {
     return ListenableBuilder(
       listenable: app,
       builder: (context, _) {
-        final price = fmtMoney(kPriceSom);
         final scheme = Theme.of(context).colorScheme;
-        return PopScope(
-          canPop: !widget.locked,
-          child: Scaffold(
-            appBar: AppBar(
-              title: Text(tr('subscription')),
-              automaticallyImplyLeading: !widget.locked,
-              actions: [
-                IconButton(
-                  icon: const Icon(Icons.language),
-                  onPressed: () => Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const LanguageScreen()),
+        return Scaffold(
+          appBar: AppBar(title: Text(tr('subscription'))),
+          body: SafeArea(
+            child: ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                const SubscriptionCard(),
+                const SizedBox(height: 16),
+                Text(tr('plans'),
+                    style: const TextStyle(
+                        fontSize: 18, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                for (final p in kPlans) _planTile(p, scheme),
+                const SizedBox(height: 12),
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Text(tr('bot_steps'),
+                        style: const TextStyle(fontSize: 15, height: 1.45)),
                   ),
                 ),
+                const SizedBox(height: 8),
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                      minimumSize: const Size.fromHeight(52)),
+                  onPressed: () => openBot(context),
+                  icon: const Icon(Icons.send),
+                  label: Text(tr('open_bot', {'b': kBotUsername})),
+                ),
+                const SizedBox(height: 12),
+                Card(
+                  child: ListTile(
+                    title: Text(app.deviceId,
+                        style: const TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 2)),
+                    subtitle: Text(tr('device_id')),
+                    trailing: IconButton(
+                      tooltip: tr('copy'),
+                      icon: const Icon(Icons.copy),
+                      onPressed: () => _copy(app.deviceId),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _ctrl,
+                  textCapitalization: TextCapitalization.characters,
+                  autocorrect: false,
+                  decoration: InputDecoration(
+                    labelText: tr('enter_code'),
+                    border: const OutlineInputBorder(),
+                    errorText: _msg,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                FilledButton.tonal(
+                  style: FilledButton.styleFrom(
+                      minimumSize: const Size.fromHeight(50)),
+                  onPressed: _busy ? null : _activate,
+                  child: _busy
+                      ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : Text(tr('activate')),
+                ),
               ],
-            ),
-            body: SafeArea(
-              child: ListView(
-                padding: const EdgeInsets.all(16),
-                children: [
-                  Card(
-                    color: scheme.primaryContainer,
-                    child: Padding(
-                      padding: const EdgeInsets.all(20),
-                      child: Column(
-                        children: [
-                          const Icon(Icons.workspace_premium, size: 48),
-                          const SizedBox(height: 8),
-                          Text(
-                            tr('tariff_monthly'),
-                            style: const TextStyle(fontSize: 16),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            tr('price_month', {'p': price}),
-                            style: const TextStyle(
-                                fontSize: 28, fontWeight: FontWeight.bold),
-                          ),
-                          if (!app.subscribed && app.trialLeft <= 0) ...[
-                            const SizedBox(height: 8),
-                            Text(tr('trial_over'), textAlign: TextAlign.center),
-                          ],
-                          if (app.subscribed) ...[
-                            const SizedBox(height: 8),
-                            Text(
-                              tr('sub_active', {'d': app.daysLeft.toString()}),
-                              style: const TextStyle(fontWeight: FontWeight.w600),
-                            ),
-                          ],
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Text(tr('pay_steps', {'p': price}),
-                      style: const TextStyle(fontSize: 15, height: 1.4)),
-                  const SizedBox(height: 12),
-                  _copyCard(tr('card_number'), kPayCardNumber,
-                      subtitle: kPayCardOwner),
-                  _copyCard(tr('device_id'), app.deviceId),
-                  const SizedBox(height: 4),
-                  FilledButton.icon(
-                    onPressed: _openTelegram,
-                    icon: const Icon(Icons.send),
-                    label: Text(tr('write_tg')),
-                  ),
-                  const SizedBox(height: 20),
-                  TextField(
-                    controller: _ctrl,
-                    textCapitalization: TextCapitalization.characters,
-                    decoration: InputDecoration(
-                      labelText: tr('enter_code'),
-                      border: const OutlineInputBorder(),
-                      errorText: _msg,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  FilledButton(
-                    onPressed: _busy ? null : _activate,
-                    child: _busy
-                        ? const SizedBox(
-                            width: 20,
-                            height: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : Text(tr('activate')),
-                  ),
-                ],
-              ),
             ),
           ),
         );
@@ -174,18 +265,33 @@ class _PaywallScreenState extends State<PaywallScreen> {
     );
   }
 
-  Widget _copyCard(String label, String value, {String? subtitle}) {
+  Widget _planTile(Plan p, ColorScheme scheme) {
+    final save = _savePercent(p);
     return Card(
       child: ListTile(
-        title: Text(value,
-            style: const TextStyle(
-                fontSize: 18, fontWeight: FontWeight.bold, letterSpacing: 1)),
-        subtitle: Text(subtitle == null ? label : '$label • $subtitle'),
-        trailing: IconButton(
-          tooltip: tr('copy'),
-          icon: const Icon(Icons.copy),
-          onPressed: () => _copy(value),
+        leading: CircleAvatar(
+          backgroundColor: scheme.primaryContainer,
+          child: Text('${p.days}',
+              style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 13,
+                  color: scheme.onPrimaryContainer)),
         ),
+        title: Text(tr('plan_name', {'d': '${p.days}'}),
+            style: const TextStyle(fontWeight: FontWeight.bold)),
+        subtitle: Text(tr('price_som', {'p': fmtMoney(p.price)})),
+        trailing: save > 0
+            ? Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.green.withAlpha(40),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text('-$save%',
+                    style: const TextStyle(
+                        color: Colors.green, fontWeight: FontWeight.bold)),
+              )
+            : null,
       ),
     );
   }
